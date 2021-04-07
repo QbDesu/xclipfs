@@ -1,12 +1,13 @@
+import asyncio
 import logging
+import os
 
 from sys import argv, exit, stderr
 from time import time
 
-import subprocess
-import shutil
+import selections
 
-from fuse import FUSE, Operations, LoggingMixIn
+from fuse import FUSE, Operations, LoggingMixIn, c_stat
 from stat import S_IFDIR, S_IFREG
 
 def mimetype_to_filename(mimetype: str) -> str:
@@ -17,66 +18,46 @@ def filename_to_mimetype(filename: str) -> str:
 
 class XClipFs(Operations):
     '''
-    A simple SFTP filesystem. Requires paramiko: http://www.lag.net/paramiko/
-    You need to be able to login to remote host without entering a password.
+    A simple X11/XFIXES clipboard filesystem.
     '''
 
     def __init__(self, path='.'):
-        self.xclip = shutil.which('xclip')
         self.root = path
 
+    async def get_attr_for_target(self, target: str) -> c_stat:
+        selection, e, stderr = await selections.get_selection(selections.CLIPBOARD, target)
+        return dict(st_mode=(S_IFREG | 0o755), st_size=len(selection))
+
     def getattr(self, path, fh=None):
-        '''
-        Returns a dictionary with keys identical to the stat C structure of
-        stat(2).
-
-        st_atime, st_mtime and st_ctime should be floats.
-
-        NOTE: There is an incombatibility between Linux and Mac OS X
-        concerning st_nlink of directories. Mac OS X counts all files inside
-        the directory, while Linux counts only the subdirectories.
-        '''
-
         if path == '/':
             return dict(st_mode=(S_IFDIR | 0o755), st_nlink=2)
         else:
-            target = filename_to_mimetype(path[1:]) if "." in path else path[1:]
-            args = [self.xclip, '-o', '-selection', 'clipboard', '-t', target]
-            completed_proc = subprocess.run(
-                args,
-                stdout=subprocess.PIPE,
-                stderr=stderr
-            )
-            return dict(st_mode=(S_IFREG | 0o755), st_size=len(completed_proc.stdout))
+            target = filename_to_mimetype(os.path.basename(path))
+            return asyncio.run(self.get_attr_for_target(target))
         
 
     def read(self, path, size, offset, fh):
         target = filename_to_mimetype(path[1:]) if "." in path else path[1:]
-        args = [self.xclip, '-o', '-selection', 'clipboard', '-t', target]
-        completed_proc = subprocess.run(
-            args,
-            stdout=subprocess.PIPE,
-            stderr=stderr
-        )
-        return completed_proc.stdout[offset:offset+size]
+        selection, *_ = asyncio.run(selections.get_selection(selections.CLIPBOARD, target))
+        return selection[offset:offset+size]
+
+    async def directory(self, targets):
+        return [(
+                    mimetype_to_filename(target.decode('utf-8')),
+                    await self.get_attr_for_target(target),
+                    0
+                )
+                for target in targets]
 
     def readdir(self, path, fh):
-        args = [self.xclip, '-o', '-selection', 'clipboard', '-t', 'TARGETS']
-        completed_proc = subprocess.run(
-            args,
-            stdout=subprocess.PIPE,
-            stderr=stderr
-        )
-        return ['.', '..'] + [
-                    mimetype_to_filename(name) if "/" in name else name
-                    for name in completed_proc.stdout.decode('utf-8').splitlines()
-        ]
+        selection, *_ = asyncio.run(selections.get_selection(selections.CLIPBOARD, selections.TARGETS))
+        return ['.', '..'] + asyncio.run(self.directory(selection.splitlines()))
 
 if __name__ == '__main__':
     if len(argv) != 2:
         print('usage: %s <mountpoint>' % argv[0])
         exit(1)
 
-    logging.basicConfig(level=logging.DEBUG)
+    logging.basicConfig(level=logging.INFO)
 
     fuse = FUSE(XClipFs(), argv[1], foreground=True, nothreads=True)
